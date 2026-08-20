@@ -44,13 +44,11 @@ while (IN_START == 1)
         IGNITION = 0;
         OUT_START = 0;
         SUPPLY = 0;
-        // Hier anhalten, damit das Programm SUPPLY nicht sofort wieder setzt.
-        while (1)
-        {
-        }
     }
 }
 ```
+
+Wichtig dabei: Wenn `SUPPLY = 0` die Selbsthaltung des PIC **nicht sofort wirklich abschaltet**, startet der Controller nach einem Watchdog-Reset wieder neu und setzt in `main()` erneut `SUPPLY = 1`. In diesem Fall muss zusätzlich beim Start die Reset-Ursache ausgewertet werden oder die Watchdog-Konfiguration auf softwaregesteuert (`WDTE_SWDTEN`) umgestellt werden.
 
 ## Kurzfassung
 
@@ -58,3 +56,4 @@ while (IN_START == 1)
 - auskommentiertes `CLRWDT()` => Watchdog-Reset nach der in `WDTCON` eingestellten Zeit (hier laut Kommentar: 16 s)
 - Watchdog-Reset => nur Neustart, **kein** automatisches `SUPPLY = 0`
 - weil `SUPPLY` nach Reset wieder auf `1` gesetzt wird, bleibt die Schaltung scheinbar an
+- für echtes Abschalten reicht ein Watchdog-Reset allein nicht; die Abschaltlogik muss das selbst behandeln
