@@ -39,7 +39,7 @@ while (IN_START == 1)
     __delay_ms(20);
     timeout++;
 
-    if (timeout >= 800)   // ca. 16 s bei 20 ms
+    if (timeout >= 800)   // 800 * 20 ms = 16 s
     {
         IGNITION = 0;
         OUT_START = 0;
