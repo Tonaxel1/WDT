@@ -37,6 +37,7 @@ unsigned int timeout = 0;
 while (IN_START == 1)
 {
     __delay_ms(20);
+    CLRWDT();                   // Watchdog als Backup aktiv lassen
     timeout++;
 
     if (timeout >= 800)   // 800 * 20 ms = 16 s
@@ -49,7 +50,7 @@ while (IN_START == 1)
 }
 ```
 
-Wichtig dabei: Wenn `SUPPLY = 0` die Selbsthaltung des PIC **nicht sofort wirklich abschaltet**, startet der Controller nach einem Watchdog-Reset wieder neu und setzt in `main()` erneut `SUPPLY = 1`. In diesem Fall muss zusätzlich beim Start die Reset-Ursache ausgewertet werden oder die Watchdog-Konfiguration auf softwaregesteuert (`WDTE_SWDTEN`) umgestellt werden.
+Wichtig dabei: Wenn der Abschalt-Timeout per Softwarezähler erfolgen soll, muss der Watchdog in dieser Schleife weiter mit `CLRWDT()` bedient werden, sonst erreicht der Zähler den Abschaltpunkt unter Umständen gar nicht. Wenn `SUPPLY = 0` die Selbsthaltung des PIC **nicht sofort wirklich abschaltet**, startet der Controller nach einem Watchdog-Reset wieder neu und setzt in `main()` erneut `SUPPLY = 1`. In diesem Fall muss zusätzlich beim Start die Reset-Ursache ausgewertet werden oder die Watchdog-Konfiguration auf softwaregesteuert (`WDTE_SWDTEN`) umgestellt werden.
 
 ## Kurzfassung
 
@@ -57,4 +58,5 @@ Wichtig dabei: Wenn `SUPPLY = 0` die Selbsthaltung des PIC **nicht sofort wirkli
 - auskommentiertes `CLRWDT()` => Watchdog-Reset nach der in `WDTCON` eingestellten Zeit (hier laut Kommentar: 16 s)
 - Watchdog-Reset => nur Neustart, **kein** automatisches `SUPPLY = 0`
 - weil `SUPPLY` nach Reset wieder auf `1` gesetzt wird, bleibt die Schaltung scheinbar an
+- soll stattdessen ein Software-Timeout abschalten, muss die Schleife den Watchdog weiter löschen
 - für echtes Abschalten reicht ein Watchdog-Reset allein nicht; die Abschaltlogik muss das selbst behandeln
