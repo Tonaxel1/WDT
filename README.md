@@ -54,6 +54,6 @@ while (IN_START == 1)
 ## Kurzfassung
 
 - `WDTE_ON` => Watchdog ist immer aktiv
-- auskommentiertes `CLRWDT()` => nach ca. 16 s Watchdog-Reset
+- auskommentiertes `CLRWDT()` => Watchdog-Reset nach der in `WDTCON` eingestellten Zeit (hier laut Kommentar: 16 s)
 - Watchdog-Reset => nur Neustart, **kein** automatisches `SUPPLY = 0`
 - weil `SUPPLY` nach Reset wieder auf `1` gesetzt wird, bleibt die Schaltung scheinbar an
