@@ -44,6 +44,7 @@ while (IN_START == 1)
         IGNITION = 0;
         OUT_START = 0;
         SUPPLY = 0;
+        // Hier anhalten, damit das Programm SUPPLY nicht sofort wieder setzt.
         while (1)
         {
         }
