@@ -95,8 +95,13 @@ gcc -std=c99 -Wall -Wextra -o /tmp/test_regression tests/test_regression_pr2_bug
   `ZEIT` Ticks – Pulsbreite, nicht nur Anzahl), Sensorflanken während
   wartendem Ladebeginn, während aktiver Ladung und gleichzeitig mit
   Compare-Abschalten, Timer1-Überlauf/Signalverlust, `CompareSetzen()`- und
-  `TICKS_GUARD`-Grenzfälle, Drehzahlbegrenzer, Startwinkel 0/klein/20 sowie
-  ein zu kurzes Ladefenster. Alle Fälle bestehen mit dem korrigierten Code.
+  `TICKS_GUARD`-Grenzfälle, Drehzahlbegrenzer, Startwinkel 0/klein/20, ein zu
+  kurzes Ladefenster sowie (neu) den Übergang vom letzten Startfunken zum
+  Normalfunken im Detail: erfolgreiche Rettung durch den Rückfall in
+  `NormalenFunkenPlanen()` bei spätem Idealtermin (Periode 1700) und der
+  physisch unvermeidbare Einzelausfall, wenn selbst der Rückfall keinen
+  Platz mehr hat (Periode 1500, siehe unten). Alle Fälle bestehen mit dem
+  korrigierten Code.
 - `tests/test_regression_pr2_bug.c` bindet zusätzlich eine wörtliche Kopie
   der **alten** (PR-#2-)Fassung von `SensorEreignis()`/`isr()` ein und
   reproduziert damit gezielt eine Sensorflanke während aktiver Ladung: Mit
@@ -114,6 +119,77 @@ nachgewiesen** – nachgewiesen ist, dass dieser Fehlerpfad im Code von PR #2
 existierte, zu den beobachteten Symptomen passen würde und durch die
 Korrektur beseitigt ist.
 
+## Nachgemeldeter Aussetzer: "Es fehlt noch der 6. Puls"
+
+Nach der PR-#2-Korrektur wurde weiterhin ein fehlender Puls beim Übergang
+vom Start- zum Normalbetrieb gemeldet. Mit dem hostseitigen Modell ließ sich
+dafür folgender **reproduzierbarer, von der PR-#2-Korrektur unabhängiger**
+Fehlerpfad in `NormalenFunkenPlanen()` bestätigen (Nutzerzählung: Sync =
+Impuls 1, Startfunken = Impulse 2–5, der hier betroffene Übergangsfunke wäre
+Impuls 6):
+
+Der Funke unmittelbar nach Startfunke 5 wird direkt in der ISR beim
+Abschalten dieses Startfunkens geplant (`isr()`, Zweig
+`START_ABSCHALTEN`, ruft `NormalenFunkenPlanen()`). Diese Funktion berechnet
+den winkelbasierten Ladebeginn relativ zum Referenzimpuls, bei dem Timer1
+zuletzt auf 0 gesetzt wurde – **aber** zwischen diesem Referenzimpuls und dem
+Aufruf ist bereits die volle Ladezeit des gerade beendeten Startfunkens
+vergangen. Bei langer Ladezeit (`LADEZEIT` nahe 5, `ZEIT`≈750 Ticks) und
+großem Vorwinkel (`VOR_W` nahe 40) kann der berechnete Ladebeginn dadurch
+bereits in der Vergangenheit liegen; `CompareSetzen()` verwirft ihn dann
+korrekt, aber der Rückgabewert wurde bislang ignoriert – der Funke fiel
+ersatzlos aus, alle späteren Impulse liefen danach wieder korrekt (kein
+dauerhafter Phasenfehler, aber ein permanent fehlender Einzelimpuls an genau
+dieser Übergangsstelle).
+
+**Konkrete, im Repository nachvollziehbare Reproduktion** (Periode 1500
+Ticks ≙ 10000 U/min unterhalb `DREHZ_MAX=11000`, `START_WINKEL=20`,
+`VOR_W=40`, `LADEZEIT=5`): Startfunke 5 schaltet bei Tick 833 ab, der ideale
+Ladebeginn des Übergangsfunkens läge aber schon bei Tick 583 – innerhalb der
+noch laufenden Ladung des Startfunkens. Dies ist eine gültige, aber
+elektrisch extreme Einstellungskombination (siehe `EinstellungenGueltig()`);
+ob sie dem konkreten, vom Nutzer beobachteten Bild entspricht, ist **nicht
+bewiesen**.
+
+**Korrektur:** `NormalenFunkenPlanen()` versucht jetzt, wenn der ideale
+winkelbasierte Termin bereits abgelaufen ist, einen sicheren Rückfall: sofort
+(mit `TICKS_GUARD` Abstand zum aktuellen Timer1-Stand) mit **voller**
+Ladezeit `ZEIT` laden – aber nur, wenn diese volle Ladezeit dabei mit
+`TICKS_GUARD`-Sicherheitsabstand vor dem für die aktuelle Periode
+angenommenen nächsten Referenzimpuls endet. Das bedeutet:
+
+- Die Ladezeit wird nie verkürzt und nie verlängert.
+- Der Rückfall-Funke überlappt nie mit dem gerade beendeten Startfunken
+  (Ladebeginn immer erst nach dessen Abschalten + `TICKS_GUARD`).
+- Es wird nie nach dem angenommenen Referenzimpuls gezündet (nur ein
+  *späterer*, nie ein früherer Zündwinkel als eingestellt).
+- Passt selbst der sofortige Rückfall nicht mehr sicher vor den nächsten
+  Referenzimpuls (wie im obigen Beispiel: Startfunke schaltet bereits bei
+  833 Ticks ab, `TICKS_GUARD` + `ZEIT` + `TICKS_GUARD` = 1582 Ticks reichen
+  bei 1500 Ticks Periode nicht mehr), bleibt dieser eine Übergangsfunke
+  weiterhin bewusst aus – ein Zünden würde sonst entweder die Ladezeit
+  verkürzen, mit dem Startfunken überlappen oder nach dem Referenzimpuls
+  liegen, was alles explizit vermieden werden soll. Synchronisation, OT_1
+  und alle nachfolgenden Impulse bleiben davon unberührt.
+
+Andere, in der Aufgabenstellung genannte Kandidaten (Startwinkel 0, exakt
+gleichzeitiger Sensor-/Compare-Impuls beim Übergang) wurden mit dem
+Hostmodell zusätzlich untersucht, führten dort aber – anders als der
+konkrete Ladezeit-/Vorwinkel-Fall oben – nicht zu einem Impulsausfall; ISR-
+Rechenzeit/-Latenz kann das Hostmodell grundsätzlich nicht abbilden (siehe
+unten).
+
+`tests/test_ignition_timing.c` enthält für diesen Übergang zwei neue,
+gezielte Testfälle: einen, bei dem der Rückfall den sonst ausfallenden
+Impuls erfolgreich rettet (Periode 1700), und einen, bei dem selbst der
+Rückfall keinen Platz mehr hat und der Impuls – nachweislich einmalig und
+ohne Folgeschäden für spätere Impulse – ausfällt (Periode 1500, siehe oben).
+Beide Fälle wurden zunächst gegen den unveränderten Code als fehlschlagend
+verifiziert.
+
+**Auch dies ersetzt keine Hardwaremessung.** Ob die tatsächliche Ursache des
+vom Nutzer beobachteten Aussetzers exakt diesem Pfad entspricht, bleibt ohne
+Messung mit bekannter Kanalzuordnung und Firmwareversion je Puls offen.
 
 ## 11-Byte-UART-Paket
 

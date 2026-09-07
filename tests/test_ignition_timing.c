@@ -319,6 +319,183 @@ static void test_kurzes_ladefenster_wird_verworfen(void)
     CHECK(zuend_zustand == ZUEND_AUS, "kein Zustandswechsel bei verworfenem Ladefenster");
 }
 
+/*
+ * Testfall 10: Übergang vom letzten Startfunken (Impuls 4, OT_1 5) zum
+ * Normalfunken vor Impuls 5 ("6. Puls" in Nutzerzählung: Sync=1,
+ * Start 1-4=2..5, dieser Funke=6). Bei langer Ladezeit (LADEZEIT=5,
+ * ZEIT=750) und großem Vorwinkel (VOR_W=40) kann der winkelbasierte
+ * Ladebeginn für diesen Funken bereits vergangen sein, wenn der ISR-Aufruf
+ * für das Abschalten von Startfunke 4 (und damit NormalenFunkenPlanen())
+ * erfolgt - hier bei Periode 1700 der Fall (idealer Ladebeginn 761 Ticks,
+ * aber Startfunke 4 schaltet erst bei 844 Ticks ab). Der Rückfall in
+ * NormalenFunkenPlanen() muss diesen Funken dann sofort (mit
+ * TICKS_GUARD-Abstand nach dem Abschalten von Startfunke 4) mit voller
+ * Ladezeit ZEIT laden, OHNE mit dem Startfunken zu überlappen und OHNE
+ * nach dem angenommenen nächsten Referenzimpuls zu zünden (später als
+ * ideal, nie früher). Referenzimpulse 4 und 5 (Sensorflanken-Zählung)
+ * entsprechen dabei genau den Zündereignis-Indizes 3 (letzter Startfunke)
+ * und 4 (Rückfall-Normalfunke) sowie 5 (erster regulär vor Impuls 6
+ * geplanter Normalfunke) unten.
+ */
+static void test_uebergang_rueckfall_bei_spaetem_idealtermin(void)
+{
+    const unsigned int periode = 1700u;
+    const unsigned char start_winkel = 20u, vor_w = 40u, ladezeit = 5u;
+    const unsigned int dreh_w = 4000u, dreh_max = 11000u;
+    unsigned long letzter_start_termin, letzter_start_ende;
+    unsigned long ideal_vor_ticks, ideal_start_termin;
+    unsigned long ref_impuls4, ref_impuls5;
+    int i;
+
+    sim_reset(start_winkel, vor_w, ladezeit, dreh_w, dreh_max);
+    logger_start();
+
+    sim_sensor_edge(isr);            /* Synchronisationsimpuls */
+    for (i = 1; i <= 5; i++) {
+        sim_advance(isr, periode);
+        sim_sensor_edge(isr);
+    }
+    sim_advance(isr, periode);        /* letzten geplanten Funken abschließen lassen */
+
+    CHECK(synchronisiert == 1u, "Synchronisation bleibt über den Übergang hinweg erhalten");
+    CHECK(OT_1 == 5u, "OT_1 verbleibt nach Erreichen von 5 auf 5 (kein Stillstand)");
+    CHECK(ereignis_zahl == 6,
+          "6 Zündereignisse: 4 Startfunken + Rückfall-Normalfunke + 1 regulärer Normalfunke "
+          "(kein Ausfall des Übergangsfunkens trotz spätem Idealtermin)");
+
+    for (i = 0; i < ereignis_zahl; i++) {
+        CHECK(ereignisse[i].abgeschlossen, "jedes Zündereignis wurde korrekt beendet");
+        CHECK((ereignisse[i].ende_zeit - ereignisse[i].start_zeit) == ZEIT,
+              "volle Ladezeit ZEIT auch beim Rückfall-Funken, keine Verkürzung");
+    }
+    for (i = 1; i < ereignis_zahl; i++)
+        CHECK(ereignisse[i].start_zeit > ereignisse[i - 1].ende_zeit,
+              "kein Überlappen des Rückfall-Funkens mit dem vorherigen Startfunken");
+
+    /* Referenzimpuls 4 (Sensorflanken-Zählung, Sync=Impuls 1): letzter
+     * Startfunke (Zündereignis-Index 3, "Impuls 5" in OT_1-Zählung). */
+    ref_impuls4 = 4UL * periode;
+    letzter_start_termin = (unsigned long)((periode * start_winkel) / 360UL);
+    if (letzter_start_termin < TICKS_GUARD)
+        letzter_start_termin = TICKS_GUARD;
+    letzter_start_ende = ref_impuls4 + letzter_start_termin + ZEIT;
+    CHECK(ereignisse[3].start_zeit == ref_impuls4 + letzter_start_termin,
+          "Startfunke 4 beginnt exakt beim Startwinkel-Termin vor Referenzimpuls 4");
+
+    /* Idealer (winkelbasierter) Ladebeginn des Übergangsfunkens - liegt
+     * hier bereits vor dem Abschalten von Startfunke 4. */
+    ideal_vor_ticks = ((unsigned long)periode * vor_w + 180UL) / 360UL;
+    ideal_start_termin = ref_impuls4 + periode - ideal_vor_ticks - ZEIT;
+    CHECK(ideal_start_termin < letzter_start_ende,
+          "Testvoraussetzung: idealer Ladebeginn liegt vor Abschalten von Startfunke 4 "
+          "(genau der Fall, den der Rückfall behandeln muss)");
+
+    /* Rückfall-Normalfunke (Zündereignis-Index 4, unmittelbar nach Impuls
+     * 4/Startfunke 4, "6. Puls" in Nutzerzählung): beginnt exakt
+     * TICKS_GUARD nach Abschalten von Startfunke 4, nie früher als das. */
+    CHECK(ereignisse[4].start_zeit == letzter_start_ende + TICKS_GUARD,
+          "Rückfall-Funke beginnt exakt TICKS_GUARD nach Abschalten des letzten Startfunkens");
+    CHECK(ereignisse[4].start_zeit > ideal_start_termin,
+          "Rückfall-Funke zündet später als der (hier unerreichbare) Idealtermin, nie früher");
+    CHECK(ereignisse[4].ende_zeit + TICKS_GUARD <= ref_impuls4 + periode,
+          "Rückfall-Funke endet mit Sicherheitsabstand vor dem angenommenen Referenzimpuls 5");
+
+    /* Referenzimpuls 5: regulärer, wieder ideal getimter Normalfunke vor
+     * Referenzimpuls 6 (Zündereignis-Index 5). */
+    ref_impuls5 = ref_impuls4 + periode;
+    CHECK(ereignisse[5].start_zeit == ref_impuls5 + ideal_start_termin - ref_impuls4,
+          "erster regulärer Normalfunke nach dem Übergang wieder exakt idealer Vorwinkel-Termin");
+}
+
+/*
+ * Testfall 11: Physisch unvermeidbarer Ausfall des Übergangsfunkens
+ * ("6. Puls") bei zu kurzer Periode für die eingestellte Ladezeit/den
+ * Vorwinkel - konkrete Grenzfall-Reproduktion aus der Aufgabenstellung
+ * (Periode 1500, START_WINKEL=20, VOR_W=40, LADEZEIT=5 -> ZEIT=750,
+ * DREHZ_W=4000, 10000 U/min unterhalb DREHZ_MAX=11000). Hier reicht selbst
+ * der sofortige Rückfall aus Testfall 10 nicht mehr aus: Das Abschalten
+ * von Startfunke 4 (bei 833 Ticks) liegt bereits so spät, dass selbst eine
+ * sofort danach beginnende volle Ladezeit ZEIT vor dem angenommenen
+ * nächsten Referenzimpuls (1500 Ticks) nicht mehr sicher Platz hat. Dieser
+ * eine Funke bleibt daher bewusst aus - NICHT durch verkürzte Ladezeit,
+ * Überlappung oder Zündung nach dem Referenzimpuls erzwungen (siehe
+ * NormalenFunkenPlanen()). Alle übrigen Impulse (insbesondere ab
+ * Referenzimpuls 5) müssen weiterhin exakt und ohne Doppelzündung
+ * getimt werden; OT_1/Synchronisation dürfen dadurch nicht gestört werden.
+ *
+ * WICHTIG: Dies ist eine gültige, aber elektrisch extreme
+ * Einstellungskombination (Ladezeit + Vorwinkel beanspruchen zusammen
+ * einen Großteil der Periode); ob genau dieser Fall dem vom Nutzer am
+ * Oszilloskop beobachteten Bild entspricht, ist NICHT bewiesen - siehe
+ * README.md.
+ */
+static void test_uebergang_unvermeidbarer_ausfall_bei_ueberlanger_ladezeit(void)
+{
+    const unsigned int periode = 1500u;
+    const unsigned char start_winkel = 20u, vor_w = 40u, ladezeit = 5u;
+    const unsigned int dreh_w = 4000u, dreh_max = 11000u;
+    unsigned long letzter_start_termin, letzter_start_ende;
+    unsigned long ref_impuls4, ref_impuls5, ref_impuls6;
+    unsigned long ideal_vor_ticks, ideal_start_termin;
+    int i;
+
+    sim_reset(start_winkel, vor_w, ladezeit, dreh_w, dreh_max);
+    logger_start();
+
+    sim_sensor_edge(isr);
+    for (i = 1; i <= 8; i++) {
+        sim_advance(isr, periode);
+        sim_sensor_edge(isr);
+    }
+    sim_advance(isr, periode);
+
+    CHECK(synchronisiert == 1u, "Synchronisation bleibt trotz ausgefallenem Übergangsfunken erhalten");
+    CHECK(OT_1 == 5u, "OT_1 bleibt auf 5 (kein Stillstand, kein Signalverlust ausgelöst)");
+    CHECK(ereignis_zahl == 8,
+          "genau 8 statt 9 Zündereignisse: 4 Startfunken + 4 Normalfunken - der eine, "
+          "physisch nicht unterzubringende Übergangsfunke ('6. Puls') bleibt bewusst aus");
+
+    for (i = 0; i < ereignis_zahl; i++) {
+        CHECK(ereignisse[i].abgeschlossen, "jedes verbleibende Zündereignis wurde korrekt beendet");
+        CHECK((ereignisse[i].ende_zeit - ereignisse[i].start_zeit) == ZEIT,
+              "volle Ladezeit ZEIT bei allen verbleibenden Funken (keine Verkürzung)");
+    }
+    for (i = 1; i < ereignis_zahl; i++)
+        CHECK(ereignisse[i].start_zeit > ereignisse[i - 1].ende_zeit,
+              "keine überlappenden/doppelten Zündereignisse trotz ausgefallenem Übergangsfunken");
+
+    ref_impuls4 = 4UL * periode;
+    letzter_start_termin = (unsigned long)((periode * start_winkel) / 360UL);
+    if (letzter_start_termin < TICKS_GUARD)
+        letzter_start_termin = TICKS_GUARD;
+    letzter_start_ende = ref_impuls4 + letzter_start_termin + ZEIT;
+    CHECK(ereignisse[3].ende_zeit == letzter_start_ende,
+          "letzter Startfunke (Index 3) schaltet exakt nach ZEIT Ticks ab");
+
+    /* Auch der sofortige Rückfall (Testfall 10) hätte hier keinen Platz
+     * mehr vor dem Referenzimpuls - das ist die Voraussetzung, die diesen
+     * Testfall von Testfall 10 unterscheidet. */
+    CHECK((letzter_start_ende + TICKS_GUARD + ZEIT + TICKS_GUARD) >= (ref_impuls4 + periode),
+          "Testvoraussetzung: selbst der sofortige Rückfall passt nicht mehr vor Referenzimpuls 5");
+
+    ideal_vor_ticks = ((unsigned long)periode * vor_w + 180UL) / 360UL;
+    ideal_start_termin = periode - ideal_vor_ticks - ZEIT;
+
+    /* Kein Zündereignis zwischen dem Abschalten von Startfunke 4 und
+     * Referenzimpuls 5 (Index 4 ist bereits der reguläre Normalfunke vor
+     * Referenzimpuls 6, nicht mehr der ausgefallene vor Referenzimpuls 5). */
+    ref_impuls5 = ref_impuls4 + periode;
+    ref_impuls6 = ref_impuls5 + periode;
+    CHECK(ereignisse[4].start_zeit == ref_impuls5 + ideal_start_termin,
+          "erster nach dem Ausfall verbleibender Normalfunke ist exakt vor Referenzimpuls 6 "
+          "geplant (nicht der ausgefallene vor Referenzimpuls 5)");
+    CHECK(ereignisse[4].start_zeit > ref_impuls5,
+          "kein nachgeholter Funke unmittelbar bei/vor Referenzimpuls 5 selbst");
+    CHECK(ereignisse[5].start_zeit == ref_impuls6 + ideal_start_termin,
+          "Normalfunke vor Referenzimpuls 7 wieder exakt idealer Vorwinkel-Termin "
+          "(Timing erholt sich vollständig, kein dauerhafter Phasenfehler)");
+}
+
 int main(void)
 {
     test_start_und_normalbetrieb();
@@ -330,6 +507,8 @@ int main(void)
     test_drehzahlbegrenzer();
     test_startwinkel_grenzwerte();
     test_kurzes_ladefenster_wird_verworfen();
+    test_uebergang_rueckfall_bei_spaetem_idealtermin();
+    test_uebergang_unvermeidbarer_ausfall_bei_ueberlanger_ladezeit();
 
     if (test_fehler == 0) {
         printf("Alle Tests erfolgreich (Hostmodell, kein Zielcompiler/keine Hardware).\n");
