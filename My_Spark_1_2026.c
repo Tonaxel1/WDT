@@ -49,7 +49,11 @@ void Aufwachen(void);
 
 static unsigned int Timer1Lesen(void)
 {
-    return ((unsigned int)TMR1H << 8) | TMR1L;
+    unsigned char niedrig, hoch;
+
+    niedrig = TMR1L;                /* Das Lesen von L latcht H auf diesem PIC. */
+    hoch = TMR1H;
+    return ((unsigned int)hoch << 8) | niedrig;
 }
 
 static void SpuleAus(void)
@@ -86,7 +90,7 @@ static unsigned char CompareSetzen(unsigned int termin, unsigned int jetzt)
     return 1;
 }
 
-static unsigned char NormalenFunkenPlanen(unsigned int jetzt)
+static unsigned char NormalenFunkenPlanen(void)
 {
     unsigned long vor_ticks;
     unsigned long abschalt_termin;
@@ -109,7 +113,7 @@ static unsigned char NormalenFunkenPlanen(unsigned int jetzt)
     abschalt_termin = (unsigned long)timer_wert - vor_ticks;
     start_termin = (unsigned int)(abschalt_termin - ZEIT);
     normal_termin = start_termin;
-    if (!CompareSetzen(start_termin, jetzt))
+    if (!CompareSetzen(start_termin, Timer1Lesen()))
         return 0;                   /* Termin ist durch ISR-/Rechenzeit überholt. */
 
     zuend_zustand = NORMAL_LADEN;
@@ -118,7 +122,6 @@ static unsigned char NormalenFunkenPlanen(unsigned int jetzt)
 
 static void SensorEreignis(void)
 {
-    unsigned int jetzt;
     unsigned int start_termin;
 
     /* Der Zählerwert gehört immer zum Impulszeitpunkt, nie zu späterem Code. */
@@ -128,8 +131,6 @@ static void SensorEreignis(void)
     TMR1L = 0;
     PIR1bits.TMR1IF = 0;
     T1CONbits.TMR1ON = 1;
-    jetzt = 0;
-
     if (!synchronisiert) {
         synchronisiert = 1;         /* Erste Teilperiode nach Stillstand verwerfen. */
         OT_1 = 1;
@@ -157,13 +158,13 @@ static void SensorEreignis(void)
                          START_WINKEL) / 360UL);
         if (start_termin < TICKS_GUARD)
             start_termin = TICKS_GUARD;
-        if (CompareSetzen(start_termin, jetzt))
+        if (CompareSetzen(start_termin, Timer1Lesen()))
             zuend_zustand = START_LADEN;
         return;
     }
 
     /* Ab Impuls 5 wird der Funken vor dem folgenden (sechsten) Impuls geplant. */
-    NormalenFunkenPlanen(jetzt);
+    NormalenFunkenPlanen();
 }
 
 void interrupt isr(void)
@@ -192,7 +193,7 @@ void interrupt isr(void)
             zuend_zustand = ZUEND_AUS;
             /* Startfunken 5 zuerst abschalten, danach Funken 6 planen. */
             if (OT_1 >= 5u)
-                NormalenFunkenPlanen(jetzt);
+                NormalenFunkenPlanen();
         } else if (zuend_zustand == NORMAL_LADEN) {
             COIL = 1;
             DREHZ = 1;
@@ -239,7 +240,7 @@ void interrupt isr(void)
         if (RCSTAbits.FERR) {
             rx_index = 0;
         } else if (rx_fertig == 0u) {
-            if (zeichen == (unsigned char)'S') {
+            if (rx_index == 0u && zeichen == (unsigned char)'S') {
                 rx_puffer[0] = zeichen;
                 rx_index = 1;
                 rx_timeout = 0;
@@ -361,16 +362,24 @@ void Aufwachen(void)
 
 void Anzeige(void)
 {
-    if (!synchronisiert) {
+    unsigned long drehzahl;
+    unsigned char ist_synchronisiert, gie;
+
+    gie = INTCONbits.GIE;
+    INTCONbits.GIE = 0;
+    drehzahl = DREHZAHL;
+    ist_synchronisiert = synchronisiert;
+    INTCONbits.GIE = gie;
+    if (!ist_synchronisiert) {
         GRUEN = 1;
         BLAU = 1;
         return;
     }
-    if (DREHZAHL <= (unsigned long)WERT_1 * 500UL) {
+    if (drehzahl <= (unsigned long)WERT_1 * 500UL) {
         ROT = 1; GRUEN = 1; BLAU = 0;
-    } else if (DREHZAHL <= (unsigned long)WERT_2 * 500UL) {
+    } else if (drehzahl <= (unsigned long)WERT_2 * 500UL) {
         ROT = 1; GRUEN = 0; BLAU = 1;
-    } else if (DREHZAHL <= (unsigned long)WERT_3 * 500UL) {
+    } else if (drehzahl <= (unsigned long)WERT_3 * 500UL) {
         ROT = 0; GRUEN = 0; BLAU = 1;
     } else {
         ROT = 0; GRUEN = 1; BLAU = 1;
