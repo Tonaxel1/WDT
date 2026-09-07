@@ -101,6 +101,7 @@ static unsigned char NormalenFunkenPlanen(void)
     unsigned long abschalt_termin;
     unsigned int start_termin;
     unsigned int vorwinkel;
+    unsigned int jetzt;
 
     if ((!synchronisiert) || (DREHZAHL >= DREHZ_MAX))
         return 0;
@@ -117,10 +118,37 @@ static unsigned char NormalenFunkenPlanen(void)
 
     abschalt_termin = (unsigned long)timer_wert - vor_ticks;
     start_termin = (unsigned int)(abschalt_termin - ZEIT);
-    normal_termin = start_termin;
-    if (!CompareSetzen(start_termin, Timer1Lesen()))
-        return 0;                   /* Termin ist durch ISR-/Rechenzeit überholt. */
 
+    if (!CompareSetzen(start_termin, Timer1Lesen())) {
+        /*
+         * Der winkelbasierte Ladebeginn liegt bereits in der Vergangenheit
+         * oder zu nah an "jetzt". Das tritt insbesondere beim direkten
+         * Übergang vom letzten Startfunken auf: Abschalten des Startfunkens
+         * und dieser Aufruf laufen im selben ISR-Aufruf (siehe isr(),
+         * START_ABSCHALTEN), sodass zwischen dem für den Winkel
+         * angenommenen Referenzzeitpunkt (Timer1==0 beim vorigen
+         * Sensorimpuls) und "jetzt" bereits die volle Ladezeit des
+         * Startfunkens vergangen sein kann.
+         *
+         * Sicherer Rückfall: sofort (mit TICKS_GUARD-Abstand zu "jetzt")
+         * laden, aber NUR, wenn die volle Ladezeit ZEIT dabei mit
+         * Sicherheitsabstand TICKS_GUARD vor dem für diese Periode
+         * angenommenen nächsten Referenzimpuls (timer_wert) endet. Das
+         * verkürzt die Ladezeit nie, zündet nie nach dem Referenzimpuls
+         * und überlappt nie mit dem gerade beendeten Funken - der
+         * tatsächliche Zündwinkel wird dadurch höchstens später (nie
+         * früher) als eingestellt. Ist selbst dafür kein Platz mehr,
+         * bleibt dieser eine Funke sicher aus (siehe README.md).
+         */
+        jetzt = Timer1Lesen();
+        start_termin = (unsigned int)(jetzt + TICKS_GUARD);
+        if (((unsigned long)start_termin + ZEIT + TICKS_GUARD) >= (unsigned long)timer_wert)
+            return 0;                /* Auch der Rückfall passt nicht mehr sicher. */
+        if (!CompareSetzen(start_termin, jetzt))
+            return 0;                /* Termin ist durch ISR-/Rechenzeit überholt. */
+    }
+
+    normal_termin = start_termin;
     zuend_zustand = NORMAL_LADEN;
     return 1;
 }
