@@ -2,11 +2,16 @@
  * Controller: PIC16F1827, Compiler: HI-TECH C, interner Takt: 8 MHz
  * Sensorsignal auf RB4, Funke beim Abschalten von COIL (RA4).
  *********************************************************************************/
+#ifdef HOST_TEST
+/* Hostseitiges Register-/Zeitmodell für automatisierte Tests, siehe tests/. */
+#include "tests/host_pic_shim.h"
+#else
 #include <htc.h>
 #include <pic16f1827.h>
 
 __CONFIG(FOSC_INTOSC & PWRTE_ON & BOREN_ON & MCLRE_OFF & WDTE_OFF & CP_OFF & PLLEN_OFF);
 __CONFIG(LVP_OFF);
+#endif
 
 #define _XTAL_FREQ 8000000
 #define SENSOR RB4
@@ -124,6 +129,20 @@ static void SensorEreignis(void)
 {
     unsigned int start_termin;
 
+    /*
+     * Läuft noch eine Ladung/Abschaltung, darf Timer1 NICHT zurückgesetzt
+     * werden: Der bereits in CCPR1 programmierte Termin ist ein absoluter
+     * Timer1-Stand. Ein Reset würde ihn nicht überschreiben, aber seine
+     * Zeitbasis verändern und ihn damit um bis zu eine volle Timer1-Periode
+     * verzögern oder verlieren (beobachteter Aussetzer/verdoppelter Abstand).
+     * Dieses Sensorereignis wird daher konservativ verworfen, bevor der
+     * Zähler angefasst wird; die laufende Ladung/Zündung bleibt unangetastet.
+     */
+    if (zuend_zustand != ZUEND_AUS) {
+        PIR1bits.TMR1IF = 0;   /* Simultanflag: kein fälschliches Stillstand-Timeout. */
+        return;
+    }
+
     /* Der Zählerwert gehört immer zum Impulszeitpunkt, nie zu späterem Code. */
     T1CONbits.TMR1ON = 0;
     timer_wert = Timer1Lesen();
@@ -142,13 +161,6 @@ static void SensorEreignis(void)
     DREHZAHL = 15000000UL / timer_wert;
     if (DREHZAHL > 12000UL)
         DREHZAHL = 12000UL;
-
-    /*
-     * Ein Abschalttermin wird niemals durch ein Sensorereignis überschrieben.
-     * Bei Kollision wird der folgende Funken konservativ verworfen.
-     */
-    if (zuend_zustand != ZUEND_AUS)
-        return;
 
     if (OT_1 < 5u) {
         OT_1++;
@@ -432,6 +444,7 @@ void Init(void)
                                  wert1, wert2, wert3);
 }
 
+#ifndef HOST_TEST
 void main(void)
 {
     Init();
@@ -468,3 +481,4 @@ void main(void)
         Anzeige();
     }
 }
+#endif /* HOST_TEST */
