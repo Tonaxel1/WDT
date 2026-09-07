@@ -1,469 +1,484 @@
 /*********************************************************************************
-*        File: My Spark_1_2026.c
-*        Controller: PIC16f1827
-*        Compiler: Hitech C
-*        Date: 02.04.2026.
-*        Author: Axel
-*        Description: Sensorsignal rein, Funken raus, serielle Parametereingabe
-************************************************************************************
-         Header files
-************************************************************************************/
+ * Controller: PIC16F1827, Compiler: HI-TECH C, interner Takt: 8 MHz
+ * Sensorsignal auf RB4, Funke beim Abschalten von COIL (RA4).
+ *********************************************************************************/
+#ifdef HOST_TEST
+/* Hostseitiges Register-/Zeitmodell fÃ¼r automatisierte Tests, siehe tests/. */
+#include "tests/host_pic_shim.h"
+#else
 #include <htc.h>
-#include <pic16f1827.h>          //Pic Werte
+#include <pic16f1827.h>
 
-/***********************************************************************************
-         Configuration Bits
-************************************************************************************/
 __CONFIG(FOSC_INTOSC & PWRTE_ON & BOREN_ON & MCLRE_OFF & WDTE_OFF & CP_OFF & PLLEN_OFF);
-__CONFIG (LVP_OFF); // Config 1 + 2
+__CONFIG(LVP_OFF);
+#endif
 
-/***********************************************************************************
-         Konstanten
-************************************************************************************/
-#define  _XTAL_FREQ 8000000
-#define  SENSOR  RB4
-#define  LED_1   LATA0
-#define  LED_2   LATA1
-#define  COIL    LATA4
-#define  DREHZ   LATB3
-#define  ROT     LATB5
-#define  GRUEN   LATB6
-#define  BLAU    LATB7
+#define _XTAL_FREQ 8000000
+#define SENSOR RB4
+#define LED_1 LATA0
+#define LED_2 LATA1
+#define COIL LATA4
+#define DREHZ LATB3
+#define ROT LATB5
+#define GRUEN LATB6
+#define BLAU LATB7
 
-/**********************************************************************************
-         Variablen, Programmdeklarationen
-***********************************************************************************/
-unsigned char OT_1, LADEZEIT, WERT_1, WERT_2, WERT_3, TEMP, TXWERT;
-unsigned char STARTFUNKE, START_WINKEL;
-unsigned int DREHZ_W, VOR_W, DREHZ_MAX, ZEIT;
-unsigned long TIMER_WERT, DREHZAHL, SOLLWINKEL, SOLLW_WERT;
-unsigned char BYTE1, BYTE2, BYTE3, BYTE4, BYTE5, BYTE6, BYTE7, BYTE8, BYTE9, BYTE10, BYTE11;
+#define TICKS_GUARD 16u
+#define UART_TIMEOUT_TICKS 2u
+#define EEPROM_BYTES 10u
 
-void Init (void);
-void EESchreibe (void);
+#define ZUEND_AUS 0u
+#define START_LADEN 1u
+#define START_ABSCHALTEN 2u
+#define NORMAL_LADEN 3u
+#define NORMAL_ABSCHALTEN 4u
+
+volatile unsigned char OT_1, LADEZEIT, WERT_1, WERT_2, WERT_3;
+volatile unsigned char START_WINKEL, zuend_zustand, synchronisiert;
+volatile unsigned int DREHZ_W, VOR_W, DREHZ_MAX, ZEIT;
+volatile unsigned int timer_wert, normal_termin;
+volatile unsigned long DREHZAHL;
+volatile unsigned char rx_puffer[11], rx_index, rx_fertig, rx_timeout;
+volatile unsigned char zeitbasis, blink_schritte, blink_teiler, tx_rest;
+volatile unsigned char eeprom_ausstehend, eeprom_index;
+
+static unsigned char eeprom_puffer[EEPROM_BYTES];
+
+void Init(void);
 void EELese(void);
-void Funke (void);
-void Blink (void);
-void Empfang (void);
-void Aufwachen (void);
-/***********************************************************************************
-         Interrupt Routine - robust, ohne blockierende Schleifen
-***********************************************************************************/
+void EmpfangAuswerten(void);
+void EEPROMDienst(void);
+void Anzeige(void);
+void Blink(void);
+void Aufwachen(void);
+
+static unsigned int Timer1Lesen(void)
+{
+    unsigned char niedrig, hoch;
+
+    niedrig = TMR1L;                /* Das Lesen von L latcht H auf diesem PIC. */
+    hoch = TMR1H;
+    return ((unsigned int)hoch << 8) | niedrig;
+}
+
+static void SpuleAus(void)
+{
+    COIL = 0;
+    DREHZ = 0;
+    LED_2 = 0;
+}
+
+static void Stillstand(void)
+{
+    PIE1bits.CCP1IE = 0;
+    PIR1bits.CCP1IF = 0;
+    zuend_zustand = ZUEND_AUS;
+    synchronisiert = 0;
+    OT_1 = 0;
+    DREHZAHL = 0;
+    normal_termin = 0;
+    SpuleAus();
+}
+
+/* Compare nur setzen, wenn der Termin noch sicher vor uns liegt. */
+static unsigned char CompareSetzen(unsigned int termin, unsigned int jetzt)
+{
+    if ((termin <= jetzt) || ((unsigned int)(termin - jetzt) < TICKS_GUARD))
+        return 0;
+
+    PIE1bits.CCP1IE = 0;
+    PIR1bits.CCP1IF = 0;
+    CCPR1H = (unsigned char)(termin >> 8);
+    CCPR1L = (unsigned char)termin;
+    PIR1bits.CCP1IF = 0;
+    PIE1bits.CCP1IE = 1;
+    return 1;
+}
+
+static unsigned char NormalenFunkenPlanen(void)
+{
+    unsigned long vor_ticks;
+    unsigned long abschalt_termin;
+    unsigned int start_termin;
+    unsigned int vorwinkel;
+
+    if ((!synchronisiert) || (DREHZAHL >= DREHZ_MAX))
+        return 0;
+
+    if (DREHZAHL < DREHZ_W)
+        vorwinkel = (unsigned int)(((unsigned long)DREHZAHL * VOR_W +
+                      (DREHZ_W >> 1)) / DREHZ_W);
+    else
+        vorwinkel = VOR_W;
+
+    vor_ticks = ((unsigned long)timer_wert * vorwinkel + 180UL) / 360UL;
+    if ((vor_ticks + ZEIT) >= timer_wert)
+        return 0;                   /* Ladung wÃ¤re vor dem Referenzimpuls nÃ¶tig. */
+
+    abschalt_termin = (unsigned long)timer_wert - vor_ticks;
+    start_termin = (unsigned int)(abschalt_termin - ZEIT);
+    normal_termin = start_termin;
+    if (!CompareSetzen(start_termin, Timer1Lesen()))
+        return 0;                   /* Termin ist durch ISR-/Rechenzeit Ã¼berholt. */
+
+    zuend_zustand = NORMAL_LADEN;
+    return 1;
+}
+
+static void SensorEreignis(void)
+{
+    unsigned int start_termin;
+
+    /*
+     * LÃ¤uft noch eine Ladung/Abschaltung, darf Timer1 NICHT zurÃ¼ckgesetzt
+     * werden: Der bereits in CCPR1 programmierte Termin ist ein absoluter
+     * Timer1-Stand. Ein Reset wÃ¼rde ihn nicht Ã¼berschreiben, aber seine
+     * Zeitbasis verÃ¤ndern und ihn damit um bis zu eine volle Timer1-Periode
+     * verzÃ¶gern oder verlieren (beobachteter Aussetzer/verdoppelter Abstand).
+     * Dieses Sensorereignis wird daher konservativ verworfen, bevor der
+     * ZÃ¤hler angefasst wird; die laufende Ladung/ZÃ¼ndung bleibt unangetastet.
+     */
+    if (zuend_zustand != ZUEND_AUS) {
+        PIR1bits.TMR1IF = 0;   /* Simultanflag: kein fÃ¤lschliches Stillstand-Timeout. */
+        return;
+    }
+
+    /* Der ZÃ¤hlerwert gehÃ¶rt immer zum Impulszeitpunkt, nie zu spÃ¤terem Code. */
+    T1CONbits.TMR1ON = 0;
+    timer_wert = Timer1Lesen();
+    TMR1H = 0;
+    TMR1L = 0;
+    PIR1bits.TMR1IF = 0;
+    T1CONbits.TMR1ON = 1;
+    if (!synchronisiert) {
+        synchronisiert = 1;         /* Erste Teilperiode nach Stillstand verwerfen. */
+        OT_1 = 1;
+        return;
+    }
+    if (timer_wert == 0)
+        return;
+
+    DREHZAHL = 15000000UL / timer_wert;
+    if (DREHZAHL > 12000UL)
+        DREHZAHL = 12000UL;
+
+    if (OT_1 < 5u) {
+        OT_1++;
+        if (DREHZAHL >= DREHZ_MAX)
+            return;
+        start_termin = (unsigned int)(((unsigned long)timer_wert *
+                         START_WINKEL) / 360UL);
+        if (start_termin < TICKS_GUARD)
+            start_termin = TICKS_GUARD;
+        if (CompareSetzen(start_termin, Timer1Lesen()))
+            zuend_zustand = START_LADEN;
+        return;
+    }
+
+    /* Ab Impuls 5 wird der Funken vor dem folgenden (sechsten) Impuls geplant. */
+    NormalenFunkenPlanen();
+}
 
 void interrupt isr(void)
 {
-    if (INTCONbits.IOCIF && IOCBFbits.IOCBF4)
-    {
-        if (OT_1 == 5)
-        {
-          OT_1 = 6;
-          Funke();
-        }
-        T1CONbits.TMR1ON = 0;
-        TIMER_WERT = (TMR1H << 8) + TMR1L;
-        TMR1L = 0;
-        TMR1H = 0;
-        T1CONbits.TMR1ON = 1;
-        PIR1bits.TMR1IF = 0;
-        if (TIMER_WERT == 0) TIMER_WERT = 1;
+    unsigned int jetzt;
 
-        DREHZAHL = 15000000UL / TIMER_WERT;
-        if (DREHZAHL > 12000) DREHZAHL = 12000;
-
-        if (OT_1 < 5)
-        {
-            OT_1++;
-            SOLLW_WERT = ((unsigned long)TIMER_WERT * START_WINKEL) / 360UL;
-            if (SOLLW_WERT < 1) SOLLW_WERT = 1;
-            STARTFUNKE = 1;           
-        }
-        else
-        {
-            unsigned long temp = (unsigned long)DREHZAHL * VOR_W;
-            if (DREHZAHL < DREHZ_W)
-                SOLLWINKEL = (temp + (DREHZ_W >> 1)) / DREHZ_W;
-            else
-                SOLLWINKEL = VOR_W;
-
-            temp = (unsigned long)TIMER_WERT * (360 - SOLLWINKEL);
-            SOLLW_WERT = ((temp + 180) / 360) - ZEIT;
-            if (SOLLW_WERT < 1) SOLLW_WERT = 1;
-        }
-
-        CCPR1L = SOLLW_WERT & 0xFF;
-        CCPR1H = SOLLW_WERT >> 8;
-
+    if (INTCONbits.IOCIF && IOCBFbits.IOCBF4) {
+        SensorEreignis();
         IOCBFbits.IOCBF4 = 0;
         INTCONbits.IOCIF = 0;
     }
-}
-/**********************************************************************************
-         Main
-***********************************************************************************/
-void main (void)
-{
-  ROT = 1;
-  GRUEN = 1;
-  BLAU = 1;
-  Init();
-  LED_1 = 0;
-  LED_2 = 0;
-  COIL = 0;
-  DREHZ = 1;
-  Blink();
-  ROT = 0;
-  __delay_ms(100);
-  ROT = 1;
-  GRUEN = 0;
-  __delay_ms(100);
-  GRUEN = 1;
-  BLAU = 0;
-  __delay_ms(100);
-  BLAU = 1;               //Test LED´s
-  
-  PIE1bits.CCP1IE = 1; // CCP1 Compare Interrupt aktivieren
-  TMR1L = 0;
-  TMR1H = 0;
-  OT_1 = 0;
-  TEMP = 0;
-  Aufwachen();
-  IOCBNbits.IOCBN4 = 1;
-  PIE1bits.TMR1IE = 1;
-  PIR1bits.TMR1IF = 0;
-  T1CON = 0b00110001;
-  CCP1CON = 0b00001010;
-  INTCON = 0b10001000;
-  
-  TXWERT = 0;
-  while (TXWERT < 250)
-  {
-    TXREG =  0b11011101;
-    __delay_ms(1);
-    while (TXIF == 0);
-    TXWERT++;
-  } 
-  
 
-  while (1)
-  { 
-    if (PIR1bits.RCIF)
-    Empfang();
-
-    if (PIR1bits.TMR1IF == 1)
-    {
-      PIR1bits.TMR1IF = 0;
-      GRUEN = 1;
-      BLAU = 1;
-      OT_1 = 0;
-    }
-
-
-    if (PIR1bits.CCP1IF)
-    {
-        if (STARTFUNKE)
-        {
-            Funke();                 // Zündung nach OT für die ersten 5 Impulse
-            STARTFUNKE = 0;
-        }
-        else if ((DREHZAHL < DREHZ_MAX) && (OT_1 >= 5))
-        {
-            Funke();
-        }
+    if (PIR1bits.CCP1IF && PIE1bits.CCP1IE) {
         PIR1bits.CCP1IF = 0;
+        jetzt = Timer1Lesen();
+        if (zuend_zustand == START_LADEN) {
+            COIL = 1;
+            DREHZ = 1;
+            LED_2 = 1;
+            if (CompareSetzen((unsigned int)(jetzt + ZEIT), jetzt))
+                zuend_zustand = START_ABSCHALTEN;
+            else
+                Stillstand();
+        } else if (zuend_zustand == START_ABSCHALTEN) {
+            SpuleAus();
+            zuend_zustand = ZUEND_AUS;
+            /* Startfunken 5 zuerst abschalten, danach Funken 6 planen. */
+            if (OT_1 >= 5u)
+                NormalenFunkenPlanen();
+        } else if (zuend_zustand == NORMAL_LADEN) {
+            COIL = 1;
+            DREHZ = 1;
+            LED_2 = 1;
+            if (CompareSetzen((unsigned int)(jetzt + ZEIT), jetzt))
+                zuend_zustand = NORMAL_ABSCHALTEN;
+            else
+                Stillstand();
+        } else if (zuend_zustand == NORMAL_ABSCHALTEN) {
+            SpuleAus();
+            PIE1bits.CCP1IE = 0;
+            zuend_zustand = ZUEND_AUS;
+        } else {
+            PIE1bits.CCP1IE = 0;
+        }
     }
 
-    if ((DREHZAHL <= 500*WERT_1)&&(PIR1bits.TMR1IF == 0))
-    { 
-      ROT = 1;
-      GRUEN = 1; 
-      BLAU = 0; 
+    /* Ein gleichzeitiger Sensorimpuls gewinnt; dessen ISR hat TMR1IF gelÃ¶scht. */
+    if (PIR1bits.TMR1IF && PIE1bits.TMR1IE) {
+        PIR1bits.TMR1IF = 0;
+        Stillstand();
     }
 
-    if ((DREHZAHL >= WERT_1*500)&&(DREHZAHL <= WERT_2*500)&&(PIR1bits.TMR1IF == 0))
-    { 
-      ROT = 1; 
-      GRUEN = 0; 
-      BLAU = 1; 
+    if (INTCONbits.TMR0IF && INTCONbits.TMR0IE) {
+        INTCONbits.TMR0IF = 0;
+        zeitbasis++;
+        if (rx_index != 0u && ++rx_timeout >= UART_TIMEOUT_TICKS)
+            rx_index = 0;
+        if (blink_schritte != 0u && ++blink_teiler >= 6u) {
+            blink_teiler = 0;
+            LED_1 = !LED_1;
+            blink_schritte--;
+        }
     }
 
-    if ((DREHZAHL >= WERT_2*500)&&(DREHZAHL <= WERT_3*500)&&(PIR1bits.TMR1IF == 0))
-    { 
-      ROT = 0; 
-      GRUEN = 0; 
-      BLAU = 1;
-    }
-
-    if ((DREHZAHL >= WERT_3*500)&&(PIR1bits.TMR1IF == 0))
-    { 
-      ROT = 0; 
-      GRUEN = 1; 
-      BLAU = 1; 
-    }
-  }
-}
-/**********************************************************************************
-         Funktionen, Unterprogramme
-***********************************************************************************/
-void Aufwachen (void)
-{
-  while (TEMP < 100)
-  {
-    TEMP++;
-    if (TEMP < 100)
-    TXREG = 0b10101010;
-    __delay_us(500);
-  } 
-}
-
-
-void Empfang (void)
-{
-    unsigned int timeout;
-    unsigned char i;
-    unsigned char tmp;
-
-    if (!PIR1bits.RCIF) return;
-
-    if (RCSTAbits.OERR) {
-        RCSTAbits.CREN = 0;
-        RCSTAbits.CREN = 1;
-    }
-
-    for (i = 1; i <= 11; ++i)
-    {
-        timeout = 8000u; // Bei 8 MHz.  20 ms
-
-        // Warte auf neues empfangenes Byte
-        while (!PIR1bits.RCIF)
-        {
-            if (--timeout == 0u) {
-                // Timeout: Abbruch, unvollständige Übertragung -> raus
-                return;
+    if (PIR1bits.RCIF && PIE1bits.RCIE) {
+        unsigned char zeichen;
+        if (RCSTAbits.OERR) {
+            RCSTAbits.CREN = 0;
+            RCSTAbits.CREN = 1;
+            rx_index = 0;
+        }
+        zeichen = RCREG;             /* FERR-Byte verwerfen und neu synchronisieren. */
+        if (RCSTAbits.FERR) {
+            rx_index = 0;
+        } else if (rx_fertig == 0u) {
+            if (rx_index == 0u && zeichen == (unsigned char)'S') {
+                rx_puffer[0] = zeichen;
+                rx_index = 1;
+                rx_timeout = 0;
+            } else if (rx_index != 0u) {
+                rx_puffer[rx_index++] = zeichen;
+                rx_timeout = 0;
+                if (rx_index == 11u) {
+                    rx_fertig = 1;
+                    rx_index = 0;
+                }
             }
         }
+    }
+}
 
-        // Lese RCREG (dies setzt RCIF zurück, falls keine weiteren Daten)
-        tmp = RCREG;
+static unsigned char EinstellungenGueltig(unsigned char start, unsigned char vor,
+                                          unsigned char lade, unsigned int dreh_w,
+                                          unsigned int dreh_max, unsigned char wert1,
+                                          unsigned char wert2, unsigned char wert3)
+{
+    if ((start > 20u) || (vor == 0u) || (vor > 40u))
+        return 0;
+    if ((lade < 1u) || (lade > 5u))
+        return 0;
+    if ((dreh_w < 2000u) || (dreh_w > 6000u) ||
+        (dreh_max < 4000u) || (dreh_max > 11000u) || (dreh_max < dreh_w))
+        return 0;
+    if ((wert1 == 0u) || (wert3 > 30u) ||
+        (wert1 > wert2) || (wert2 > wert3))
+        return 0;
+    return 1;
+}
 
-        // Bei Framing-Fehlern könnte man hier optional reagieren:
-        // if (RCSTAbits.FERR) { /* Fehlerbehandlung falls gewünscht */ }
+static void EinstellungenUebernehmen(unsigned char start, unsigned char vor,
+                                     unsigned char lade, unsigned int dreh_w,
+                                     unsigned int dreh_max, unsigned char wert1,
+                                     unsigned char wert2, unsigned char wert3)
+{
+    unsigned char gie = INTCONbits.GIE;
 
-        // In die globalen Byte-Variablen schreiben
-        switch (i)
-        {
-            case 1: BYTE1 = tmp; break;
-            case 2: BYTE2 = tmp; break;    // Beachte: Variable heißt BYTE2 (Typos im Original)
-            case 3: BYTE3 = tmp; break;
-            case 4: BYTE4 = tmp; break;
-            case 5: BYTE5 = tmp; break;
-            case 6: BYTE6 = tmp; break;
-            case 7: BYTE7 = tmp; break;
-            case 8: BYTE8 = tmp; break;
-            case 9: BYTE9 = tmp; break;
-            case 10: BYTE10 = tmp; break;
-            case 11: BYTE11 = tmp; break;
+    INTCONbits.GIE = 0;
+    START_WINKEL = start;
+    VOR_W = vor;
+    LADEZEIT = lade;
+    ZEIT = (unsigned int)lade * 125u + 125u; /* 1..5 ms: 250..750 Timer1-Ticks */
+    DREHZ_W = dreh_w;
+    DREHZ_MAX = dreh_max;
+    WERT_1 = wert1;
+    WERT_2 = wert2;
+    WERT_3 = wert3;
+    INTCONbits.GIE = gie;
+}
+
+void EmpfangAuswerten(void)
+{
+    unsigned char daten[11];
+    unsigned char i, gie;
+    unsigned int dreh_w, dreh_max;
+
+    if (!rx_fertig)
+        return;
+    gie = INTCONbits.GIE;
+    INTCONbits.GIE = 0;
+    for (i = 0; i < 11u; i++)
+        daten[i] = rx_puffer[i];
+    rx_fertig = 0;
+    INTCONbits.GIE = gie;
+
+    dreh_w = ((unsigned int)daten[4] << 8) | daten[5];
+    dreh_max = ((unsigned int)daten[6] << 8) | daten[7];
+    if (!EinstellungenGueltig(daten[1], daten[2], daten[3], dreh_w, dreh_max,
+                              daten[8], daten[9], daten[10]))
+        return;
+
+    EinstellungenUebernehmen(daten[1], daten[2], daten[3], dreh_w, dreh_max,
+                             daten[8], daten[9], daten[10]);
+    for (i = 0; i < EEPROM_BYTES; i++)
+        eeprom_puffer[i] = daten[i + 1u];
+    eeprom_index = 0;
+    eeprom_ausstehend = 1;
+    Blink();
+}
+
+void EEPROMDienst(void)
+{
+    unsigned char gie;
+
+    /* Schreiben nur im sicheren Stillstand; WR lÃ¤uft dann ohne Warten weiter. */
+    if ((!eeprom_ausstehend) || synchronisiert || EECON1bits.WR)
+        return;
+    if (eeprom_index >= EEPROM_BYTES) {
+        eeprom_ausstehend = 0;
+        return;
+    }
+
+    EEADRL = (unsigned char)(eeprom_index + 1u);
+    EEDATA = eeprom_puffer[eeprom_index++];
+    EECON1bits.EEPGD = 0;
+    EECON1bits.WREN = 1;
+    gie = INTCONbits.GIE;
+    INTCONbits.GIE = 0;
+    EECON2 = 0x55;
+    EECON2 = 0xAA;
+    EECON1bits.WR = 1;
+    INTCONbits.GIE = gie;
+    EECON1bits.WREN = 0;
+}
+
+void Blink(void)
+{
+    blink_schritte = 6u;
+    blink_teiler = 0;
+}
+
+void Aufwachen(void)
+{
+    tx_rest = 100u;
+}
+
+void Anzeige(void)
+{
+    unsigned long drehzahl;
+    unsigned char ist_synchronisiert, gie;
+
+    gie = INTCONbits.GIE;
+    INTCONbits.GIE = 0;
+    drehzahl = DREHZAHL;
+    ist_synchronisiert = synchronisiert;
+    INTCONbits.GIE = gie;
+    if (!ist_synchronisiert) {
+        GRUEN = 1;
+        BLAU = 1;
+        return;
+    }
+    if (drehzahl <= (unsigned long)WERT_1 * 500UL) {
+        ROT = 1; GRUEN = 1; BLAU = 0;
+    } else if (drehzahl <= (unsigned long)WERT_2 * 500UL) {
+        ROT = 1; GRUEN = 0; BLAU = 1;
+    } else if (drehzahl <= (unsigned long)WERT_3 * 500UL) {
+        ROT = 0; GRUEN = 0; BLAU = 1;
+    } else {
+        ROT = 0; GRUEN = 1; BLAU = 1;
+    }
+}
+
+void EELese(void)
+{
+    EECON1bits.EEPGD = 0;
+    EECON1bits.RD = 1;
+}
+
+void Init(void)
+{
+    unsigned char start, vor, lade, wert1, wert2, wert3;
+    unsigned int dreh_w, dreh_max;
+
+    LATA = 0;
+    LATB = 0;
+    ANSELA = 0;
+    ANSELB = 0;
+    TRISA = 0b00000000;             /* COIL-Latch ist vor der Ausgangsfreigabe aus. */
+    TRISB = 0b00010111;             /* RB7 (BLAU) ist Ausgang. */
+    WPUB = 0b00010111;
+    OPTION_REG = 0b00000111;        /* Timer0: Fosc/4, 1:256, Ãœberlauf 32,768 ms. */
+    OSCCON = 0b01110010;            /* interner 8-MHz-Takt */
+    APFCON = 0;                     /* EUSART Standard: RX RB1, TX RB2; RB4 bleibt Sensor. */
+    RCSTA = 0b10010000;
+    SPBRGH = 0;
+    SPBRG = 207;                    /* 9600 Baud, BRG16 und BRGH */
+    TXSTA = 0b10100100;
+    BAUDCON = 0b00001000;
+
+    EEADRL = 1; EELese(); start = EEDATA;
+    EEADRL = 2; EELese(); vor = EEDATA;
+    EEADRL = 3; EELese(); lade = EEDATA;
+    EEADRL = 4; EELese(); dreh_w = (unsigned int)EEDATA << 8;
+    EEADRL = 5; EELese(); dreh_w |= EEDATA;
+    EEADRL = 6; EELese(); dreh_max = (unsigned int)EEDATA << 8;
+    EEADRL = 7; EELese(); dreh_max |= EEDATA;
+    EEADRL = 8; EELese(); wert1 = EEDATA;
+    EEADRL = 9; EELese(); wert2 = EEDATA;
+    EEADRL = 10; EELese(); wert3 = EEDATA;
+
+    if (!EinstellungenGueltig(start, vor, lade, dreh_w, dreh_max,
+                              wert1, wert2, wert3))
+        EinstellungenUebernehmen(10u, 40u, 3u, 4000u, 11000u, 4u, 8u, 12u);
+    else
+        EinstellungenUebernehmen(start, vor, lade, dreh_w, dreh_max,
+                                 wert1, wert2, wert3);
+}
+
+#ifndef HOST_TEST
+void main(void)
+{
+    Init();
+    COIL = 0;
+    DREHZ = 0;
+    ROT = GRUEN = BLAU = 1;
+    Aufwachen();
+
+    TMR1H = 0;
+    TMR1L = 0;
+    T1CON = 0b00110001;             /* Fosc/4, 1:8, Timer1 an */
+    CCP1CON = 0b00001010;           /* Compare, nur Interrupt */
+    IOCBNbits.IOCBN4 = 1;
+    IOCBFbits.IOCBF4 = 0;
+    INTCONbits.IOCIF = 0;
+    PIR1bits.TMR1IF = 0;
+    PIR1bits.CCP1IF = 0;
+    PIE1bits.TMR1IE = 1;
+    PIE1bits.CCP1IE = 0;
+    PIE1bits.RCIE = 1;
+    INTCONbits.TMR0IF = 0;
+    INTCONbits.TMR0IE = 1;
+    INTCONbits.IOCIE = 1;
+    INTCONbits.PEIE = 1;
+    INTCONbits.GIE = 1;
+
+    while (1) {
+        EmpfangAuswerten();
+        EEPROMDienst();
+        if (tx_rest != 0u && PIR1bits.TXIF) {
+            TXREG = 0b10101010;
+            tx_rest--;
         }
-
-        // Kurze Pause nicht erforderlich; nächstes Byte wird erwartet
-    }
-
-    if (BYTE1 == (unsigned char)'S')
-    {
-        EEDATA = BYTE2;          // Startwinkel
-        EEADRL = 1;
-        EESchreibe();            
-        EEDATA = BYTE3;          // Vorwinkel max.
-        EEADRL = 2;
-        EESchreibe();
-        EEDATA = BYTE4;          // Ladezeit
-        EEADRL = 3;
-        EESchreibe();
-        EEDATA = BYTE5;          // DREHZ_W High
-        EEADRL = 4;
-        EESchreibe();
-        EEDATA = BYTE6;          // DREHZ_W Low
-        EEADRL = 5;
-        EESchreibe();
-        EEDATA = BYTE7;          // DREHZ_MAX High
-        EEADRL = 6;
-        EESchreibe();
-        EEDATA = BYTE8;          // Drehz_Max Low
-        WERT_1 = BYTE8;
-        EEADRL = 7;
-        EESchreibe();
-        EEDATA = BYTE9;          // Unterer Drehzahlwert für LED (Blau)
-        WERT_2 = BYTE9;
-        EEADRL = 8;
-        EESchreibe();
-        EEDATA = BYTE10;         // Mittlerer Drehzahlwert für LED (Grün)
-        WERT_3 = BYTE10;
-        EEADRL = 9;
-        EESchreibe();            // Oberer Drehzahlwert für LED (Gelb)
-        EEDATA = BYTE11;
-        EEADRL = 10;
-        EESchreibe();
-
-
-        if (PIR1bits.TMR1IF == 1) // Wenn Moped aus
-        Blink();                  // Blinken bei gültigem Empfang
-
-        START_WINKEL = BYTE2;
-        // RAM-Variablen sofort aktualisieren (sonst bleiben alte Werte aus EEPROM bestehen, was zu unplausiblen Werten führt)
-        VOR_W = (unsigned int)BYTE3;
-        if (VOR_W == 0) VOR_W = 1;
-
-        DREHZ_W = ((unsigned int)BYTE6 << 8) | (unsigned int)BYTE5; 
-
-        DREHZ_MAX = ((unsigned int)BYTE8 << 8) | (unsigned int)BYTE7; 
-
-        LADEZEIT = BYTE4;
-        if (LADEZEIT == 1)
-        ZEIT = 250;
-        if (LADEZEIT == 2)
-        ZEIT = 375;
-        if (LADEZEIT == 3)
-        ZEIT = 500;
-        if (LADEZEIT == 4)
-        ZEIT = 625;
-        if (LADEZEIT == 5)
-        ZEIT = 750;
-        if (VOR_W > 40) VOR_W = 40;
-        if (VOR_W == 0) VOR_W = 1;          // Bei 0 vergrößert sich der Puls auf ca. 6 ms.
-        if (DREHZ_W < 2000 || DREHZ_W > 6000) DREHZ_W = 4000;
-        if (DREHZ_MAX < 4000 || DREHZ_MAX > 11000) DREHZ_MAX = 11000;
+        Anzeige();
     }
 }
-
-
-void Funke (void)
-{
-  COIL = 1;
-  DREHZ = 1;
-  LED_2 = 1;
-  if (LADEZEIT == 1)
-  __delay_us(1000);
-  if (LADEZEIT == 2)
-  __delay_us(1500); 
-   if (LADEZEIT == 3)
-  __delay_us(2000);
-  if (LADEZEIT == 4)
-  __delay_us(2500);
-  if (LADEZEIT == 5)
-  __delay_us(3000);
-  COIL = 0;
-  DREHZ = 0;
-  LED_2 = 0;
-}
-
-
-void Blink (void)
-{
-  LED_1 = 1;
-  __delay_ms(200);
-  LED_1 = 0;
-  __delay_ms(200);
-
-  LED_1 = 1;
-  __delay_ms(200);
-  LED_1 = 0;
-  __delay_ms(200);
-
-  LED_1 = 1;
-  __delay_ms(200);
-  LED_1 = 0;
-  __delay_ms(200);
-}
-
-
-void EESchreibe (void)
-{
-  EECON1bits.EEPGD = 0;
-  EECON1bits.WREN = 1;
-  INTCONbits.GIE = 0;
-  EECON2 = 0x55;
-  EECON2 = 0xAA;
-  EECON1bits.WR = 1;
-  while (EECON1bits.WR == 1); /* Warte auf Schreibende */
-  INTCONbits.GIE = 1;
-  EECON1bits.WREN = 0;
-}
-
-
-void EELese (void)
-{
-  EECON1bits.EEPGD = 0;
-  EECON1bits.RD = 1; /* EEDATA enthält nun den gelesenen Wert */
-}
-
-
-void Init (void)
-{
-  ANSELA = 0;
-  ANSELB = 0;
-  TRISA = 0b00000000;
-  TRISB = 0b10010111;
-  WPUB = 0b00010111;  // Pull-ups für RB0, RB2, RB3, RB4 aktivieren
-  OPTION_REG = 0b00111111;
-  OSCCON = 0b01110010;
-  RCSTA = 0b10010000;
-  SPBRGH =0;
-  SPBRG = 207;                    // 9600 Baud
-  TXSTA= 0b10100100;
-  BAUDCON = 0b00001000;
-
-  EEADRL = 1;
-  EELese();
-  START_WINKEL = EEDATA;
-  EEADRL = 2;
-  EELese();
-  VOR_W = EEDATA;
-  EEADRL = 3;
-  EELese();
-  LADEZEIT = EEDATA;
-  EEADRL = 4;
-  EELese();
-  DREHZ_W = EEDATA;
-  DREHZ_W = DREHZ_W << 8;
-  EEADRL = 5;
-  EELese();
-  DREHZ_W = DREHZ_W | EEDATA;
-  EEADRL = 6;
-  EELese();
-  DREHZ_MAX = EEDATA;
-  DREHZ_MAX = DREHZ_MAX << 8;
-  EEADRL = 7;
-  EELese();
-  DREHZ_MAX = DREHZ_MAX | EEDATA;
-  EEADRL = 8;
-  EELese();
-  WERT_1 = EEDATA;
-  EEADRL = 9;
-  EELese();
-  WERT_2 = EEDATA;
-  EEADRL = 10;
-  EELese();
-  WERT_3 = EEDATA;
-
-  if (START_WINKEL > 20) START_WINKEL = 10;
-  if (VOR_W > 40) VOR_W = 40;
-  if (DREHZ_W < 2000 || DREHZ_W > 6000) DREHZ_W = 4000;
-  if (DREHZ_MAX < 4000 || DREHZ_MAX > 12000) DREHZ_MAX = 10000;
-  if (LADEZEIT > 5)
-  LADEZEIT = 3;
-  if (LADEZEIT == 1)
-  ZEIT = 250;
-  if (LADEZEIT == 2)
-  ZEIT = 375;
-  if (LADEZEIT == 3)
-  ZEIT = 500;
-  if (LADEZEIT == 4)
-  ZEIT = 625;
-  if (LADEZEIT == 5)
-  ZEIT = 750;
-  if (WERT_1 > 30)
-  WERT_1 = 4;
-  if (WERT_2 > 30)
-  WERT_2 = 8;
-  if (WERT_3 > 30)
-  WERT_3 = 12;
-}
+#endif /* HOST_TEST */
